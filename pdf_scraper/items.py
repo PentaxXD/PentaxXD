@@ -2,6 +2,11 @@ import re
 from dataclasses import dataclass, asdict
 from typing import Iterable, List, Optional, Tuple, Dict, Any
 
+try:
+    import pdfplumber  # type: ignore
+except Exception:
+    pdfplumber = None  # optional; we can still parse from text
+
 
 IGNORED_HEADER_PATTERNS = [
     r"^Gourmet\s+International$",
@@ -158,3 +163,169 @@ def parse_line_items(text: str) -> List[LineItem]:
             idx += 1
 
     return items
+
+
+def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem]:
+    """Parse items using positional columns; falls back to text parser if pdfplumber missing.
+
+    Uses x-coordinates observed on the sample to bucket tokens into columns.
+    """
+    if pdfplumber is None:
+        # fallback: use text-only path
+        from .extractor import extract_text_from_pdf
+
+        text = extract_text_from_pdf(pdf_path, pages=[page])
+        return parse_line_items(text)
+
+    items: List[LineItem] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        p = pdf.pages[page - 1]
+        words = p.extract_words(x_tolerance=2, y_tolerance=3, use_text_flow=True)
+
+        # Column x ranges inferred from inspection
+        # Left numeric columns: order_qty (~x0 29-36), ship_qty (~59-67), units (~78-97), item (~119-141)
+        # UPC appears around x0 ~206-249
+        # Brand/description around x0 >= ~300
+        # Pack size around x0 ~472-505
+        # Price around x0 ~529-553; Ext Price ~569-594
+        def bucket_x(x: float) -> str:
+            if x < 50:
+                return "order"
+            if x < 75:
+                return "ship"
+            if x < 110:
+                return "units"
+            if x < 200:
+                return "item"
+            if x < 270:
+                return "upc"
+            if x < 360:
+                return "brand"
+            if x < 470:
+                return "desc"
+            if x < 520:
+                return "pack"
+            if x < 565:
+                return "price"
+            return "ext"
+
+        # Group words by line (y center) with small tolerance
+        rows: List[Dict[str, List[str]]] = []
+        last_y: Optional[float] = None
+        for w in words:
+            y = (w["top"] + w["bottom"]) / 2.0
+            if last_y is None or abs(y - last_y) > 4:  # new row
+                rows.append({"order": [], "ship": [], "units": [], "item": [], "upc": [], "brand": [], "desc": [], "pack": [], "price": [], "ext": []})
+                last_y = y
+            bucket = bucket_x(w["x0"])
+            rows[-1][bucket].append(w["text"])
+
+        # Collapse rows into logical items by detecting when price+ext present
+        current: Dict[str, Any] = {k: None for k in ["order","ship","units","item","upc","brand","description","pack","price","ext"]}
+        brand_buffer: List[str] = []
+        desc_buffer: List[str] = []
+
+        number_re = re.compile(r"^[0-9][0-9,]*\.?[0-9]*$")
+        units_re = re.compile(r"^[A-Z]{2}\d{3}$")
+        item_re = re.compile(r"^\d{5,}$")
+        upc_re = re.compile(r"^\d{12,14}$")
+        pack_re = re.compile(r"^\d+\/\d+(?:\.\d+)?\s*(?:OZ|LB|G|KG)$", re.IGNORECASE)
+
+        def try_flush():
+            if (
+                current["order"] and str(current["order"]).isdigit() and
+                current["ship"] and str(current["ship"]).isdigit() and
+                current["units"] and units_re.match(str(current["units"])) and
+                current["item"] and item_re.match(str(current["item"])) and
+                current["upc"] and upc_re.match(str(current["upc"])) and
+                current["pack"] and pack_re.match(str(current["pack"])) and
+                current["price"] and number_re.match(str(current["price"])) and
+                current["ext"] and number_re.match(str(current["ext"]))
+            ):
+                items.append(
+                    LineItem(
+                        order_qty=int(current["order"]),
+                        ship_qty=int(current["ship"]),
+                        units=str(current["units"]),
+                        item=str(current["item"]),
+                        upc=str(current["upc"]),
+                        brand=str(current.get("brand") or "").strip(),
+                        description=str(current.get("description") or "").strip(),
+                        pack_size=str(current["pack"]),
+                        price=float(str(current["price"]).replace(",","")),
+                        extended_price=float(str(current["ext"]).replace(",","")),
+                    )
+                )
+                for k in list(current.keys()):
+                    current[k] = None
+                brand_buffer.clear()
+                desc_buffer.clear()
+
+        in_items = False
+
+        for r in rows:
+            def first_text(key: str) -> Optional[str]:
+                vals = r.get(key) or []
+                return " ".join(vals) if vals else None
+
+            # Wait until header row detected to start capturing
+            if not in_items:
+                header_tokens = set(t.lower() for key in ("order","item","desc","pack","price","ext") for t in (r.get(key) or []))
+                if ("order" in header_tokens and "item" in header_tokens) or ("description" in header_tokens and "price" in header_tokens):
+                    in_items = True
+                # Alternatively, if row looks like a first data row
+                elif (r["order"] and r["order"][0].isdigit() and r["item"] and re.fullmatch(r"\d{5,}", r["item"][0])):
+                    in_items = True
+                else:
+                    continue
+
+            # Detect start of a new item row with required left columns
+            if r["order"] and r["ship"] and r["units"] and r["item"]:
+                # Reset state for a new item
+                brand_buffer.clear()
+                desc_buffer.clear()
+                for k in list(current.keys()):
+                    current[k] = None
+                current["order"] = r["order"][0]
+                current["ship"] = r["ship"][0]
+                current["units"] = r["units"][0]
+                current["item"] = r["item"][0]
+
+            if r["upc"] and not current["upc"]:
+                # Most rows have single UPC row after item row
+                upc_text = "".join(r["upc"]).strip()
+                if re.fullmatch(r"\d{12,14}", upc_text):
+                    current["upc"] = upc_text
+
+            # brand column handling
+            if r.get("brand"):
+                brand_text = " ".join(r["brand"]).strip()
+                if re.fullmatch(r"[A-Z][A-Z\s&.'-]+", brand_text) and not re.search(r"\d", brand_text):
+                    brand_buffer.append(brand_text)
+                    current["brand"] = " ".join(brand_buffer)
+
+            # description column handling
+            if r["desc"]:
+                desc_text = " ".join(r["desc"]).strip()
+                if desc_text.lower() not in {"brand", "description", "pack size", "price", "ext. price"}:
+                    desc_buffer.append(desc_text)
+                    current["description"] = " ".join(desc_buffer)
+
+            # pack/price/ext
+            if r["pack"]:
+                pack_text = " ".join(r["pack"]).strip()
+                # Only accept if it looks like a pack size (digits/digits + unit)
+                if pack_re.match(pack_text):
+                    current["pack"] = pack_text
+            if r["price"]:
+                price_text = "".join(r["price"]).replace("$", "").strip()
+                if number_re.match(price_text):
+                    current["price"] = price_text
+            if r["ext"]:
+                ext_text = "".join(r["ext"]).replace("$", "").strip()
+                if number_re.match(ext_text):
+                    current["ext"] = ext_text
+
+            try_flush()
+
+        return items
