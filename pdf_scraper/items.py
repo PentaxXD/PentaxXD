@@ -350,6 +350,11 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                 if desc_text.lower() not in {"brand", "description", "pack size", "price", "ext. price"}:
                     desc_buffer.append(desc_text)
                     current["description"] = " ".join(desc_buffer)
+                    # Opportunistic pack detection within description (handles cases like "... 12/5.99OZ" or "... 12/5.99 OZ")
+                    if not current.get("pack"):
+                        m_desc_pack = re.search(r"(\d+\/\d+(?:\.\d+)?)\s*(OZ|LB|G|KG)\b", desc_text, flags=re.IGNORECASE)
+                        if m_desc_pack:
+                            current["pack"] = f"{m_desc_pack.group(1)} {m_desc_pack.group(2).upper()}"
 
             # pack/price/ext
             if r["pack"]:
@@ -357,6 +362,12 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                 # Only accept if it looks like a pack size (digits/digits + unit)
                 if pack_re.match(pack_text):
                     current["pack"] = pack_text
+                # If pack column is just a unit (e.g., "OZ"), try to combine with trailing qty in description
+                elif re.fullmatch(r"(?:OZ|LB|G|KG)", pack_text, flags=re.IGNORECASE):
+                    if current.get("description"):
+                        m_qty_only = re.search(r"(\d+\/\d+(?:\.\d+)?)\b(?!\s*(?:OZ|LB|G|KG))", current["description"], flags=re.IGNORECASE)
+                        if m_qty_only:
+                            current["pack"] = f"{m_qty_only.group(1)} {pack_text.upper()}"
             if r["price"]:
                 price_text = "".join(r["price"]).replace("$", "").strip()
                 if number_re.match(price_text):
@@ -366,9 +377,10 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                 if number_re.match(ext_text):
                     current["ext"] = ext_text
 
-            # Fallback: Sometimes pack/price/ext appear together in the description/price columns on the same row
+            # Fallback: Sometimes pack/price/ext appear together but pack is split across desc and pack columns
+            # Combine desc first to preserve natural order like "... 12/5.99 OZ $95.88 $191.76"
             if not (current.get("pack") and current.get("price") and current.get("ext")):
-                combined_triple = " ".join(sum([r.get("pack", []), r.get("price", []), r.get("ext", []), r.get("desc", [])], []))
+                combined_triple = " ".join(sum([r.get("desc", []), r.get("pack", []), r.get("price", []), r.get("ext", [])], []))
                 m_triple = pack_price_re.search(combined_triple)
                 if m_triple:
                     if not current.get("pack"):
