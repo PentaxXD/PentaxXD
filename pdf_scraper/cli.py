@@ -8,6 +8,7 @@ from .extractor import extract_text_from_pdf
 from .filtering import filter_lines
 from .fields import extract_fields
 from .config import load_config, ScrapeConfig
+from .items import parse_line_items
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -112,3 +113,14 @@ def scrape(
         Path(final_output_path).write_text(payload, encoding="utf-8")
 
     typer.echo(payload)
+
+
+@app.command()
+def items(
+    pdf: str = typer.Argument(..., help="Path to PDF file"),
+    page: Optional[int] = typer.Option(None, "--page", help="1-based page number to parse"),
+):
+    """Parse invoice line items into structured JSON rows."""
+    text = _read_text(pdf, [page] if page else None)
+    rows = [li.to_dict() for li in parse_line_items(text)]
+    typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
