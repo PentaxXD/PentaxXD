@@ -8,7 +8,7 @@ from .extractor import extract_text_from_pdf
 from .filtering import filter_lines
 from .fields import extract_fields
 from .config import load_config, ScrapeConfig
-from .items import parse_line_items
+from .items import parse_line_items, parse_line_items_layout_aware
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -119,8 +119,41 @@ def scrape(
 def items(
     pdf: str = typer.Argument(..., help="Path to PDF file"),
     page: Optional[int] = typer.Option(None, "--page", help="1-based page number to parse"),
+    out: Optional[str] = typer.Option(None, "--out", help="Write results to path; .csv => CSV, otherwise JSON"),
 ):
-    """Parse invoice line items into structured JSON rows."""
-    text = _read_text(pdf, [page] if page else None)
-    rows = [li.to_dict() for li in parse_line_items(text)]
+    """Parse invoice line items into structured rows (JSON or CSV)."""
+    # Prefer layout-aware parsing for accurate column grouping
+    rows = [li.to_dict() for li in parse_line_items_layout_aware(pdf, page=page or 1)]
+
+    if out:
+        ext = Path(out).suffix.lower()
+        if ext == ".csv":
+            import csv
+            fieldnames = (
+                list(rows[0].keys())
+                if rows
+                else [
+                    "order_qty",
+                    "ship_qty",
+                    "units",
+                    "item",
+                    "upc",
+                    "brand",
+                    "description",
+                    "pack_size",
+                    "price",
+                    "extended_price",
+                ]
+            )
+            with open(out, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+        else:
+            payload = json.dumps(rows, ensure_ascii=False, indent=2)
+            Path(out).write_text(payload, encoding="utf-8")
+        return
+
+    # Default: print JSON to stdout
     typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
