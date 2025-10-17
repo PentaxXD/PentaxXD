@@ -189,37 +189,47 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
         # Pack size around x0 ~472-505
         # Price around x0 ~529-553; Ext Price ~569-594
         def bucket_x(x: float) -> str:
-            # Slightly widened column buckets to accommodate per-page shifts
-            if x < 55:
+            # Column thresholds tuned to observed header x positions
+            if x < 50:
                 return "order"
-            if x < 85:
+            if x < 75:
                 return "ship"
-            if x < 120:
+            if x < 110:
                 return "units"
-            if x < 215:
+            if x < 200:
                 return "item"
-            if x < 300:
+            if x < 270:
                 return "upc"
-            if x < 380:
+            if x < 360:
                 return "brand"
-            if x < 490:
+            if x < 470:
                 return "desc"
-            if x < 545:
+            if x < 520:
                 return "pack"
-            if x < 590:
+            if x < 565:
                 return "price"
             return "ext"
 
         # Group words by line (y center) with small tolerance
+        # Group words by line (y center) with small tolerance; allow small y drift within a row
         rows: List[Dict[str, List[str]]] = []
-        last_y: Optional[float] = None
+        row_ys: List[float] = []
         for w in words:
-            y = (w["top"] + w["bottom"]) / 2.0
-            if last_y is None or abs(y - last_y) > 4:  # new row
+            y_center = (w["top"] + w["bottom"]) / 2.0
+            # find existing row within tolerance
+            row_idx: Optional[int] = None
+            for i, ry in enumerate(row_ys):
+                if abs(y_center - ry) <= 3.5:
+                    row_idx = i
+                    # update tracked row y as running average to keep groups tight
+                    row_ys[i] = (ry + y_center) / 2.0
+                    break
+            if row_idx is None:
+                row_idx = len(rows)
                 rows.append({"order": [], "ship": [], "units": [], "item": [], "upc": [], "brand": [], "desc": [], "pack": [], "price": [], "ext": []})
-                last_y = y
+                row_ys.append(y_center)
             bucket = bucket_x(w["x0"])
-            rows[-1][bucket].append(w["text"])
+            rows[row_idx][bucket].append(w["text"])
 
         # Collapse rows into logical items by detecting when price+ext present
         current: Dict[str, Any] = {k: None for k in ["order","ship","units","item","upc","brand","description","pack","price","ext"]}
@@ -276,10 +286,13 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
             # Wait until header row detected to start capturing
             if not in_items:
                 header_tokens = set(t.lower() for key in ("order","item","desc","pack","price","ext") for t in (r.get(key) or []))
-                if ("order" in header_tokens and "item" in header_tokens) or ("description" in header_tokens and "price" in header_tokens):
+                # More robust header detection based on column names observed
+                if {"order","ship","units"}.issubset(header_tokens) and {"item","upc"}.intersection(header_tokens):
+                    in_items = True
+                elif {"description","price"}.issubset(header_tokens) and ("pack" in header_tokens or "size" in header_tokens):
                     in_items = True
                 # Alternatively, if row looks like a first data row
-                elif (r["order"] and r["order"][0].isdigit() and r["item"] and re.fullmatch(r"\d{5,}", r["item"][0])):
+                elif (r["order"] and r["ship"] and r["units"] and (r["item"] or r["upc"])):
                     in_items = True
                 else:
                     continue
