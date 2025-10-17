@@ -119,37 +119,85 @@ def scrape(
 def items(
     pdf: str = typer.Argument(..., help="Path to PDF file"),
     page: Optional[int] = typer.Option(None, "--page", help="1-based page number to parse"),
+    all_pages: bool = typer.Option(False, "--all-pages", help="Parse all pages in the PDF"),
     out: Optional[str] = typer.Option(None, "--out", help="Write results to path; .csv => CSV, otherwise JSON"),
+    pricing: bool = typer.Option(True, "--with-pricing/--no-pricing", help="Include derived prices (cost_per_item, store_price, online_price)"),
 ):
     """Parse invoice line items into structured rows (JSON or CSV)."""
-    # Prefer layout-aware parsing for accurate column grouping
-    rows = [li.to_dict() for li in parse_line_items_layout_aware(pdf, page=page or 1)]
+    # Collect rows from one or all pages
+    rows: list[dict] = []
+
+    if all_pages:
+        try:
+            import pdfplumber  # type: ignore
+            with pdfplumber.open(pdf) as doc:
+                total = len(doc.pages)
+        except Exception:
+            total = 1
+        for p in range(1, total + 1):
+            rows.extend(li.to_dict() for li in parse_line_items_layout_aware(pdf, page=p))
+    else:
+        rows = [li.to_dict() for li in parse_line_items_layout_aware(pdf, page=page or 1)]
+
+    # Optionally add pricing columns
+    if pricing:
+        from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
+        import re as _re
+
+        def parse_pack_qty(pack_size: str) -> Optional[int]:
+            m = _re.match(r"\s*(\d+)\s*/", pack_size)
+            return int(m.group(1)) if m else None
+
+        def to_store_price(cost_per_item: Decimal) -> Decimal:
+            raw = cost_per_item * Decimal("1.55") + Decimal("0.3")
+            # next highest value ending with 9 cents in the second decimal place (##.#9)
+            # candidate = ceil(raw*10)/10 - 0.01; if candidate < raw, bump by 0.10
+            units = (raw * Decimal(10)).to_integral_value(rounding=ROUND_CEILING)
+            tenth = (units / Decimal(10))
+            candidate = (tenth - Decimal("0.01"))
+            if candidate < raw:
+                candidate = candidate + Decimal("0.10")
+            return candidate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        for r in rows:
+            pack_qty = parse_pack_qty(str(r.get("pack_size", "")))
+            price = Decimal(str(r.get("price", "0")))
+            if pack_qty and pack_qty > 0:
+                cpi = (price / Decimal(pack_qty)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                store = to_store_price(cpi)
+                online = (store + Decimal("0.50")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                r["cost_per_item"] = float(cpi)
+                r["store_price"] = float(store)
+                r["online_price"] = float(online)
+            else:
+                r["cost_per_item"] = None
+                r["store_price"] = None
+                r["online_price"] = None
 
     if out:
         ext = Path(out).suffix.lower()
         if ext == ".csv":
             import csv
-            fieldnames = (
-                list(rows[0].keys())
-                if rows
-                else [
-                    "order_qty",
-                    "ship_qty",
-                    "units",
-                    "item",
-                    "upc",
-                    "brand",
-                    "description",
-                    "pack_size",
-                    "price",
-                    "extended_price",
-                ]
-            )
+            # Preserve a stable column order
+            base_cols = [
+                "order_qty",
+                "ship_qty",
+                "units",
+                "item",
+                "upc",
+                "brand",
+                "description",
+                "pack_size",
+                "price",
+                "extended_price",
+            ]
+            price_cols = ["cost_per_item", "store_price", "online_price"] if pricing else []
+            fieldnames = base_cols + price_cols
             with open(out, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 for row in rows:
-                    writer.writerow(row)
+                    writer.writerow({k: row.get(k) for k in fieldnames})
         else:
             payload = json.dumps(rows, ensure_ascii=False, indent=2)
             Path(out).write_text(payload, encoding="utf-8")
