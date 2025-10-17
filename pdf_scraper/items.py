@@ -189,23 +189,24 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
         # Pack size around x0 ~472-505
         # Price around x0 ~529-553; Ext Price ~569-594
         def bucket_x(x: float) -> str:
-            if x < 50:
+            # Slightly widened column buckets to accommodate per-page shifts
+            if x < 55:
                 return "order"
-            if x < 75:
+            if x < 85:
                 return "ship"
-            if x < 110:
+            if x < 120:
                 return "units"
-            if x < 200:
+            if x < 215:
                 return "item"
-            if x < 270:
+            if x < 300:
                 return "upc"
-            if x < 360:
+            if x < 380:
                 return "brand"
-            if x < 470:
+            if x < 490:
                 return "desc"
-            if x < 520:
+            if x < 545:
                 return "pack"
-            if x < 565:
+            if x < 590:
                 return "price"
             return "ext"
 
@@ -230,6 +231,10 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
         item_re = re.compile(r"^\d{5,}$")
         upc_re = re.compile(r"^\d{12,14}$")
         pack_re = re.compile(r"^\d+\/\d+(?:\.\d+)?\s*(?:OZ|LB|G|KG)$", re.IGNORECASE)
+        pack_price_re = re.compile(
+            r"(?P<pack>\d+\/\d+(?:\.\d+)?\s*(?:OZ|LB|G|KG))\s+\$?(?P<price>[0-9][0-9,]*\.?[0-9]*)\s+\$?(?P<ext>[0-9][0-9,]*\.?[0-9]*)",
+            re.IGNORECASE,
+        )
 
         def try_flush():
             if (
@@ -279,23 +284,45 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                 else:
                     continue
 
-            # Detect start of a new item row with required left columns
-            if r["order"] and r["ship"] and r["units"] and r["item"]:
-                # Reset state for a new item
-                brand_buffer.clear()
-                desc_buffer.clear()
-                for k in list(current.keys()):
-                    current[k] = None
+            # Detect start of a new item row; allow item number to be on the next line
+            if r["order"] and r["ship"] and r["units"]:
+                # If we already had a partially-filled item, try flushing before starting a new one
+                if any(current.get(k) for k in ("order", "ship", "units", "item", "upc", "pack", "price", "ext")):
+                    try_flush()
+                    # Reset state for a new item
+                    brand_buffer.clear()
+                    desc_buffer.clear()
+                    for k in list(current.keys()):
+                        current[k] = None
+                else:
+                    # Also reset buffers if we're starting for the first time within the items section
+                    brand_buffer.clear()
+                    desc_buffer.clear()
+                    for k in list(current.keys()):
+                        current[k] = None
+
                 current["order"] = r["order"][0]
                 current["ship"] = r["ship"][0]
                 current["units"] = r["units"][0]
+                if r["item"]:
+                    current["item"] = r["item"][0]
+
+            # If we are in the middle of an item and encounter a row that only has the item number, capture it
+            if (not current.get("item")) and r["item"] and not (r["order"] or r["ship"] or r["units"]):
                 current["item"] = r["item"][0]
 
-            if r["upc"] and not current["upc"]:
+            if not current["upc"]:
                 # Most rows have single UPC row after item row
-                upc_text = "".join(r["upc"]).strip()
-                if re.fullmatch(r"\d{12,14}", upc_text):
-                    current["upc"] = upc_text
+                if r["upc"]:
+                    upc_text = "".join(r["upc"]).strip()
+                    if re.fullmatch(r"\d{12,14}", upc_text):
+                        current["upc"] = upc_text
+                else:
+                    # Fallback: search for a UPC-like token anywhere in the row
+                    combined = " ".join(sum([r.get("upc", []), r.get("desc", []), r.get("brand", [])], []))
+                    m_upc_any = re.search(r"\b(\d{12,14})\b", combined)
+                    if m_upc_any:
+                        current["upc"] = m_upc_any.group(1)
 
             # brand column handling
             if r.get("brand"):
@@ -325,6 +352,18 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                 ext_text = "".join(r["ext"]).replace("$", "").strip()
                 if number_re.match(ext_text):
                     current["ext"] = ext_text
+
+            # Fallback: Sometimes pack/price/ext appear together in the description/price columns on the same row
+            if not (current.get("pack") and current.get("price") and current.get("ext")):
+                combined_triple = " ".join(sum([r.get("pack", []), r.get("price", []), r.get("ext", []), r.get("desc", [])], []))
+                m_triple = pack_price_re.search(combined_triple)
+                if m_triple:
+                    if not current.get("pack"):
+                        current["pack"] = m_triple.group("pack").strip()
+                    if not current.get("price"):
+                        current["price"] = m_triple.group("price").strip()
+                    if not current.get("ext"):
+                        current["ext"] = m_triple.group("ext").strip()
 
             try_flush()
 
