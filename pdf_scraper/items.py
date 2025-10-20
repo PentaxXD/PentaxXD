@@ -377,10 +377,18 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                 if number_re.match(ext_text):
                     current["ext"] = ext_text
 
-            # Fallback: Sometimes pack/price/ext appear together but pack is split across desc and pack columns
-            # Combine desc first to preserve natural order like "... 12/5.99 OZ $95.88 $191.76"
+            # Fallback: Sometimes pack/price/ext appear together but land in unexpected buckets
+            # Combine brand+desc first to preserve natural order like "... 12/5.99 OZ $95.88 $191.76"
             if not (current.get("pack") and current.get("price") and current.get("ext")):
-                combined_triple = " ".join(sum([r.get("desc", []), r.get("pack", []), r.get("price", []), r.get("ext", [])], []))
+                combined_triple = " ".join(
+                    sum([
+                        r.get("brand", []),
+                        r.get("desc", []),
+                        r.get("pack", []),
+                        r.get("price", []),
+                        r.get("ext", []),
+                    ], [])
+                )
                 m_triple = pack_price_re.search(combined_triple)
                 if m_triple:
                     if not current.get("pack"):
@@ -392,4 +400,6 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
 
             try_flush()
 
+        # Final attempt to flush any pending item at end of page
+        try_flush()
         return items
