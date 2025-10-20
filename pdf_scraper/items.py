@@ -34,8 +34,9 @@ COLUMN_HEADER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Accept item IDs that can be purely digits (5+) or digits with a hyphen suffix (e.g., 138915-2)
 ORDER_LINE_START = re.compile(
-    r"^(?P<order>\d+)\s+(?P<ship>\d+)\s+(?P<units>[A-Z]{2}\d{3})\s+(?P<item>\d{5,})$"
+    r"^(?P<order>\d+)\s+(?P<ship>\d+)\s+(?P<units>[A-Z]{2}\d{3})\s+(?P<item>\d{5,}(?:-\d+)?)$"
 )
 UPC_LINE = re.compile(r"^(?P<upc>\d{12,13})$")
 PRICE_LINE = re.compile(
@@ -238,7 +239,8 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
 
         number_re = re.compile(r"^[0-9][0-9,]*\.?[0-9]*$")
         units_re = re.compile(r"^[A-Z]{2}\d{3}$")
-        item_re = re.compile(r"^\d{5,}$")
+        # Allow item numbers like 138915 or 138915-2 (hyphenated suffix)
+        item_re = re.compile(r"^\d{5,}(?:-\d+)?$")
         upc_re = re.compile(r"^\d{12,14}$")
         pack_re = re.compile(r"^\d+\/\d+(?:\.\d+)?\s*(?:OZ|LB|G|KG)$", re.IGNORECASE)
         pack_price_re = re.compile(

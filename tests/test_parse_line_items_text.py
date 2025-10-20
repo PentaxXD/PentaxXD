@@ -31,3 +31,22 @@ def test_parse_two_asbach_items_from_text():
     assert it2.pack_size == "6/7.05 OZ"
     assert it2.price == 77.94
     assert round(it2.extended_price, 2) == 1402.92
+
+
+def test_parse_hyphenated_item_id():
+    sample = (
+        "4 4 CS002 138915-2\n"
+        "4008100150157\n"
+        "HENGSTENBERG MILDESSA SAUERKRAUT WITH\n"
+        "WINE LARGE TIN 2PK\n"
+        "2/342 OZ $62.98 $251.92\n"
+    )
+
+    items = parse_line_items(sample)
+    assert len(items) == 1
+    it = items[0]
+    assert it.item == "138915-2"
+    assert it.upc == "4008100150157"
+    assert it.pack_size == "2/342 OZ"
+    assert it.price == 62.98
+    assert round(it.extended_price, 2) == 251.92
