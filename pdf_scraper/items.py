@@ -135,6 +135,11 @@ def parse_line_items(text: str) -> List[LineItem]:
             token = lines[idx].strip()
             m_price = PRICE_LINE.match(token)
             if m_price:
+                final_brand = brand
+                final_description_parts = list(description_parts)
+                if not final_description_parts and len(brand_parts) > 1:
+                    final_brand = brand_parts[0].strip()
+                    final_description_parts = [part.strip() for part in brand_parts[1:] if part.strip()]
                 pack_size = m_price.group("pack")
                 price = float(m_price.group("price").replace(",", ""))
                 ext_price = float(m_price.group("ext").replace(",", ""))
@@ -147,8 +152,8 @@ def parse_line_items(text: str) -> List[LineItem]:
                         units=units,
                         item=item,
                         upc=upc,
-                        brand=brand,
-                        description=" ".join(description_parts).strip(),
+                        brand=final_brand,
+                        description=" ".join(final_description_parts).strip(),
                         pack_size=pack_size,
                         price=price,
                         extended_price=ext_price,
@@ -236,6 +241,7 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
         current: Dict[str, Any] = {k: None for k in ["order","ship","units","item","upc","brand","description","pack","price","ext"]}
         brand_buffer: List[str] = []
         desc_buffer: List[str] = []
+        last_item: Optional[LineItem] = None
 
         number_re = re.compile(r"^[0-9][0-9,]*\.?[0-9]*$")
         units_re = re.compile(r"^[A-Z]{2}\d{3}$")
@@ -249,6 +255,7 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
         )
 
         def try_flush():
+            nonlocal last_item
             if (
                 current["order"] and str(current["order"]).isdigit() and
                 current["ship"] and str(current["ship"]).isdigit() and
@@ -259,6 +266,13 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                 current["price"] and number_re.match(str(current["price"])) and
                 current["ext"] and number_re.match(str(current["ext"]))
             ):
+                brand_segments = [seg.strip() for seg in brand_buffer if seg.strip()]
+                desc_segments = [seg.strip() for seg in desc_buffer if seg.strip()]
+                brand_text = " ".join(brand_segments).strip() if brand_segments else str(current.get("brand") or "").strip()
+                desc_text = " ".join(desc_segments).strip() if desc_segments else str(current.get("description") or "").strip()
+                if not desc_text and len(brand_segments) > 1:
+                    brand_text = brand_segments[0]
+                    desc_text = " ".join(brand_segments[1:]).strip()
                 items.append(
                     LineItem(
                         order_qty=int(current["order"]),
@@ -266,13 +280,14 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                         units=str(current["units"]),
                         item=str(current["item"]),
                         upc=str(current["upc"]),
-                        brand=str(current.get("brand") or "").strip(),
-                        description=str(current.get("description") or "").strip(),
+                        brand=brand_text,
+                        description=desc_text,
                         pack_size=str(current["pack"]),
                         price=float(str(current["price"]).replace(",","")),
                         extended_price=float(str(current["ext"]).replace(",","")),
                     )
                 )
+                last_item = items[-1]
                 for k in list(current.keys()):
                     current[k] = None
                 brand_buffer.clear()
@@ -297,6 +312,30 @@ def parse_line_items_layout_aware(pdf_path: str, page: int = 1) -> List[LineItem
                 elif (r["order"] and r["ship"] and r["units"] and (r["item"] or r["upc"])):
                     in_items = True
                 else:
+                    continue
+
+            # Handle dangling description lines that appear after an item has flushed
+            if (
+                in_items
+                and not (r["order"] or r["ship"] or r["units"] or r["item"] or r["upc"] or r["pack"] or r["price"] or r["ext"])
+            ):
+                trailing_bits: List[str] = []
+                if r.get("desc"):
+                    trailing_bits.append(" ".join(r["desc"]).strip())
+                if r.get("brand") and not r.get("desc"):
+                    brand_text = " ".join(r["brand"]).strip()
+                    if brand_text and brand_text.lower() not in {"brand", "description", "pack size", "price", "ext. price"}:
+                        trailing_bits.append(brand_text)
+                trailing_bits = [t for t in trailing_bits if t]
+                if trailing_bits and last_item and not any(
+                    current.get(k) for k in ("order","ship","units","item","upc","pack","price","ext","brand","description")
+                ):
+                    extra = " ".join(trailing_bits).strip()
+                    if extra:
+                        if last_item.description:
+                            last_item.description = f"{last_item.description} {extra}".strip()
+                        else:
+                            last_item.description = extra
                     continue
 
             # Detect start of a new item row; allow item number to be on the next line
